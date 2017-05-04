@@ -12,6 +12,8 @@
 #include <signal.h>
 #include <sys/time.h>
 
+#include "sha3.h"
+
 typedef void (*init_t)(void *);
 typedef void (*update_t)(void *, void *, size_t);
 typedef void (*final_t)(void *, void *);
@@ -72,6 +74,24 @@ algo_t algo_ripemd160 =
    (update_t)RIPEMD160_Update,
    (final_t)RIPEMD160_Final};
 
+algo_t algo_sha3_256 =
+  {"SHA3-256", 32, sizeof(sha3_context),
+   (init_t)sha3_Init256,
+   (update_t)sha3_Update,
+   (final_t)sha3_Finalize};
+
+algo_t algo_sha3_384 =
+  {"SHA3-384", 32, sizeof(sha3_context),
+   (init_t)sha3_Init384,
+   (update_t)sha3_Update,
+   (final_t)sha3_Finalize};
+
+algo_t algo_sha3_512 =
+  {"SHA3-512", 32, sizeof(sha3_context),
+   (init_t)sha3_Init512,
+   (update_t)sha3_Update,
+   (final_t)sha3_Finalize};
+
 const struct {
   char *name;
   algo_t *algo;
@@ -112,6 +132,15 @@ const struct {
   {"ripemd160", &algo_ripemd160},
   {"RIPEMD-160", &algo_ripemd160},
   {"RIPEMD160", &algo_ripemd160},
+
+  {"sha3-256", &algo_sha3_256},
+  {"SHA3-256", &algo_sha3_256},
+
+  {"sha3-384", &algo_sha3_384},
+  {"SHA3-384", &algo_sha3_384},
+
+  {"sha3-512", &algo_sha3_512},
+  {"SHA3-512", &algo_sha3_512},
 
   {NULL, NULL},
 };
