@@ -1095,8 +1095,10 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "In total : ");
     show_large_num(tries_total);
     fprintf(stderr, "\n");
-    fprintf(stderr, "Speed    : %lluM/s\n\n",
-            tries_total / (elapsed.tv_usec + 1000000 * elapsed.tv_sec));
+    fprintf(stderr, "Speed    : ");
+    show_large_num((1000000 * tries_total) /
+                   (elapsed.tv_usec + 1000000 * elapsed.tv_sec));
+    fprintf(stderr, "/s\n\n");
   }
 
   if (g_pow) {

@@ -244,7 +244,7 @@ sha3_Update(void *priv, void const *bufIn, size_t len)
  * bytes are always present, but they can be the same byte.
  */
 void
-sha3_Finalize(void *priv, void *digest)
+sha3_Finalize(void *digest, void *priv)
 {
     sha3_context *ctx = (sha3_context *) priv;
 
