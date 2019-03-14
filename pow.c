@@ -1,3 +1,6 @@
+/* for `asprintf` */
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -145,20 +148,34 @@ const struct {
   {NULL, NULL},
 };
 
+/* unsigned bignum; big endian so `memcmp` can be used to compare */
+#define bn_size (int)opts.algo->digest_size
+typedef unsigned char* bn_t;
+
 struct {
-  char *mask;
   algo_t *algo;
-  unsigned char *prefix, *suffix;
-  char add_chars[0x100], rem_chars[0x100];
-  size_t pow_len;
-  bool big_endian;
   size_t num_threads;
-  bool is_binary;
   bool verbose;
   unsigned long long max_tries;
   time_t timeout;
-  unsigned char alphabet[0x100];
-  unsigned char *zmask, *omask;
+  bool is_ccc;
+  union {
+    struct {
+      char *mask;
+      unsigned char *prefix, *suffix;
+      char add_chars[0x100], rem_chars[0x100];
+      size_t pow_len;
+      bool big_endian;
+      bool is_binary;
+      unsigned char alphabet[0x100];
+      unsigned char *zmask, *omask;
+    };
+    struct {
+      char *challenge;
+      unsigned long long hardness;
+      bn_t target;
+    };
+  };
 } opts;
 
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -243,6 +260,7 @@ void usage(char *prog) {
 
   fprintf(stderr,
           "usage: %1$s [options] <algorithm> <digest mask>\n"
+          "       %1$s --ccc [options] <challenge>\n"
           "\n"
           "Options:\n"
           "  --CLASS\n"
@@ -259,21 +277,25 @@ void usage(char *prog) {
           "    *NOT* --no-0x01.\n"
           "\n"
           "  --prefix|-p <string>, --suffix|-s <string>\n"
-          "    Specifies the required prefix/suffix of a POW.  None, either or both can\n"
+          "    Specifies the required prefix/suffix of a PoW.  None, either or both can\n"
           "    be given.  The suffix/prefix should be hex-encoded when --binary is given.\n"
           "\n"
           "  --binary|-b\n"
-          "    In binary mode the pattern and POW are hex-encoded and the default\n"
+          "    In binary mode the pattern and PoW are hex-encoded and the default\n"
           "    alphabet contains all bytes except 0.\n"
           "\n"
           "  --endian|-e big|b|little|l\n"
           "    Specifies that the mask is given in little/big enddian.  Default: big.\n"
           "\n"
           "  --length|-n <number>, --min-length <number>, --max-length <number>\n"
-          "    Sets the (minimal/maximal) length of the POW.  Last occurrence takes\n"
+          "    Sets the (minimal/maximal) length of the PoW.  Last occurrence takes\n"
           "    precence, e.g. `--length 10 --max-length 20` is equivalent to\n"
           "    `--min-length 10 --max-length 20` and `--max-length 20 --length 10` is\n"
           "    equivalent to just `--length 10`.\n"
+          "\n"
+          "  --ccc\n"
+          "    Solve CCC style PoW (https://35c3ctf.ccc.ac/uploads/pow.py).  This option is\n"
+          "    incompatible with all of the options above (i.e. they will be ignored).\n"
           "\n"
           "  --threads|-J <number>\n"
           "    Sets the number of threads to spawn.  Default: number of cores.\n"
@@ -289,7 +311,7 @@ void usage(char *prog) {
           "    Sets the maximum time to run before giving up.  Default: forever.\n"
           "\n"
           "  --verbose|-v\n"
-          "    Be chatty.  The POW (if one is found) is written to STDOUT.  Everything\n"
+          "    Be chatty.  The PoW (if one is found) is written to STDOUT.  Everything\n"
           "    else goes to STDERR.\n"
           "\n"
           "  --help|-h\n"
@@ -355,6 +377,8 @@ void usage(char *prog) {
           "  POW_C3kB\n"
           "  $ pow --lower --prefix POW{ --suffix } sha1 1{12}-1{12}\n"
           "  POW{zzrglqlq}\n"
+          "  $ pow --ccc 12345678_9nNMpkwGT4\n"
+          "  3781679\n"
           );
   exit(EXIT_FAILURE);
 }
@@ -578,22 +602,93 @@ void parse_mask() {
   }
 }
 
+static inline
+int bn_cmp(bn_t a, bn_t b) {
+  return memcmp(a, b, bn_size);
+}
+
+void bn_sub(bn_t a, bn_t b) {
+  int i, tmp, borrow = 0;
+  for (i = bn_size - 1; i >= 0; i--) {
+    tmp = a[i] - b[i] - borrow;
+    a[i] = tmp & 0xff;
+    borrow = tmp < 0;
+  }
+}
+
+void bn_rshift1(bn_t x) {
+  int i;
+  for (i = bn_size - 1; i > 0; i--) {
+    x[i] = (x[i] >> 1) | (x[i - 1] << 7);
+  }
+  x[i] >>= 1;
+}
+
+void bn_lshift1(bn_t x) {
+  int i;
+  for (i = 0; i < bn_size - 1; i++) {
+    x[i] = (x[i] << 1) | (x[i + 1] >> 7);
+  }
+  x[i] <<= 1;
+}
+
+/* Calculates target := 2^digest_bits / hardness */
+bn_t calculate_target(unsigned long long hardness) {
+  bn_t target, x, y;
+  int i;
+
+  target = calloc(bn_size, 1);
+  x = calloc(bn_size, 1);
+  y = calloc(bn_size, 1);
+
+  /* set initial divisor = hardness */
+  for (i = bn_size - 1; hardness; i--) {
+    y[i] = hardness & 0xff;
+    hardness >>= 8;
+  }
+
+  /* left shift divisor as long as it will go */
+  for (i = 0; !(y[0] & 0x80); i++) {
+    bn_lshift1(y);
+  }
+
+  while (i >= 0) {
+    bn_sub(x, y);
+    target[bn_size - 1 - i / 8] |= 1 << (i & 7);
+    do {
+      i--;
+      bn_rshift1(y);
+    } while (bn_cmp(x, y) < 0);
+  }
+
+  free(y);
+  free(x);
+  return target;
+}
+
 void parse_args(int argc, char *argv[]) {
   int i, j;
   unsigned int n;
   size_t fixed_len, search_len, min_len, max_len;
   char *arg, *opt, *cls, shortopt[3] = {0}, cbuf[2] = {0};
 
+  opts.is_ccc = false;
+
+  /* CCC-style */
+  opts.challenge = NULL;
+
+  /* Non-CCC */
   opts.mask = NULL;
   opts.algo = NULL;
+  opts.prefix = (unsigned char*)"";
+  opts.suffix = (unsigned char*)"";
   opts.add_chars[0] = 0;
   opts.rem_chars[0] = 0;
-
-  opts.prefix = "";
-  opts.suffix = "";
   opts.pow_len = 0;
   opts.big_endian = true;
   opts.is_binary = false;
+
+  /* General opts */
   opts.verbose = false;
   opts.num_threads = sysconf(_SC_NPROCESSORS_ONLN);
   opts.max_tries = DEFAULT_MAX_TRIES;
@@ -620,7 +715,7 @@ void parse_args(int argc, char *argv[]) {
 #define getcls()                                    \
   do {                                              \
     for (j = 0;; j++) {                             \
-      if (NULL == classes[j].name) {                \
+      if (!classes[j].name) {                       \
         cls = NULL;                                 \
         break;                                      \
       }                                             \
@@ -696,6 +791,11 @@ void parse_args(int argc, char *argv[]) {
           getarg();
           min_len = s2uint(arg);
 
+        } else if (0 == strcmp(opt, "--ccc")) {
+        opt_ccc:
+          opts.is_ccc = true;
+          opts.algo = &algo_sha256;
+
         } else if (0 == strcmp(opt, "--threads")) {
         opt_threads:
           getarg();
@@ -721,7 +821,7 @@ void parse_args(int argc, char *argv[]) {
         } else if (0 == memcmp(opt, "--no-", 5)) {
           cls = &opt[5];
           getcls();
-          if (NULL == cls) {
+          if (!cls) {
             arg = &opt[5];
             if (1 == strlen(arg)) {
               charset_union(opts.rem_chars, arg);
@@ -739,7 +839,7 @@ void parse_args(int argc, char *argv[]) {
         } else {
           cls = &opt[2];
           getcls();
-          if (NULL == cls) {
+          if (!cls) {
           opt_unknown:
             die("unknown option: %s\n", opt);
           }
@@ -778,16 +878,26 @@ void parse_args(int argc, char *argv[]) {
         }
 
       }
+    } else if (opts.is_ccc) {
+      if (opts.challenge) {
+        die("challenge given twice\n");
+      }
+      opts.hardness = strtoll(arg, &opts.challenge, 10);
+      if (!(opts.hardness && opts.challenge && opts.challenge[0] == '_')) {
+        die("invalid challenge format (must be <number>_<string>)\n");
+      }
+      opts.challenge++;
+      opts.target = calculate_target(opts.hardness);
     } else {
       if ('1' == arg[0] || '0' == arg[0] || '?' == arg[0]) {
       opt_mask:
         if (opts.mask) {
-          die("mask specified twice\n");
+          die("mask given twice\n");
         }
         opts.mask = arg;
       } else {
         if (opts.algo) {
-          die("algorithm specified twice\n");
+          die("algorithm given twice\n");
         }
         for (j = 0; algos[j].name; j++) {
           if (0 == strcmp(arg, algos[j].name)) {
@@ -802,69 +912,74 @@ void parse_args(int argc, char *argv[]) {
     }
   }
 
-  if (NULL == opts.algo) {
-    die("missing argument: algorithm\n");
-  } else if (NULL == opts.mask) {
-    die("missing argument: mask\n");
-  }
-
-  if (opts.add_chars[0]) {
-    strcpy(opts.alphabet, opts.add_chars);
+  if (opts.is_ccc) {
+    if (!opts.challenge) {
+      die("missing argument: challenge\n");
+    }
   } else {
-    if (opts.is_binary) {
-      for (i = 0; i < 0x100; i++) {
-        opts.alphabet[i] = (i + 1) & 0xff;
-      }
+    if (!opts.algo) {
+      die("missing argument: algorithm\n");
+    } else if (!opts.mask) {
+      die("missing argument: mask\n");
+    }
+
+    if (opts.add_chars[0]) {
+      strcpy(opts.alphabet, opts.add_chars);
     } else {
-      strcpy(opts.alphabet, DEFAULT_ALPHABET);
+      if (opts.is_binary) {
+        for (i = 0; i < 0x100; i++) {
+          opts.alphabet[i] = (i + 1) & 0xff;
+        }
+      } else {
+        strcpy(opts.alphabet, DEFAULT_ALPHABET);
+      }
+    }
+
+    charset_discard(opts.alphabet, opts.rem_chars);
+
+    if (opts.is_binary) {
+      if (opts.prefix) {
+        opts.prefix = unhex(opts.prefix);
+      }
+      if (opts.suffix) {
+        opts.suffix = unhex(opts.suffix);
+      }
+    }
+
+    parse_mask();
+
+    fixed_len = strlen(opts.prefix) + strlen(opts.suffix);
+
+    if (min_len > max_len) {
+      die("minimal length is larger than maximal length\n");
+    }
+
+    if (fixed_len >= max_len) {
+      die("length is too short\n");
+    }
+
+    /* Number of characters needed to make the search space >= `max_tries` */
+    search_len = log((double)opts.max_tries) /
+      log((double)strlen(opts.alphabet));
+
+    opts.pow_len = fixed_len + search_len;
+
+    if (opts.pow_len < min_len) {
+      opts.pow_len = min_len;
+    } else if (opts.pow_len > max_len) {
+      opts.pow_len = max_len;
+      /* Length restriction takes precedent over `max_tries` */
+      search_len = opts.pow_len - fixed_len;
+      opts.max_tries = pow((double)strlen(opts.alphabet), (double)search_len);
     }
   }
-
-  charset_discard(opts.alphabet, opts.rem_chars);
-
-  if (opts.is_binary) {
-    if (opts.prefix) {
-      opts.prefix = unhex(opts.prefix);
-    }
-    if (opts.suffix) {
-      opts.suffix = unhex(opts.suffix);
-    }
-  }
-
-  parse_mask();
-
-  fixed_len = strlen(opts.prefix) + strlen(opts.suffix);
-
-  if (min_len > max_len) {
-    die("minimal length is larger than maximal length\n");
-  }
-
-  if (fixed_len >= max_len) {
-    die("length is too short\n");
-  }
-
-  /* Number of characters needed to make the search space >= `max_tries` */
-  search_len = log((double)opts.max_tries) /
-    log((double)strlen(opts.alphabet));
-
-  opts.pow_len = fixed_len + search_len;
-
-  if (opts.pow_len < min_len) {
-    opts.pow_len = min_len;
-  } else if (opts.pow_len > max_len) {
-    opts.pow_len = max_len;
-    /* Length restriction takes precedent over `max_tries` */
-    search_len = opts.pow_len - fixed_len;
-    opts.max_tries = pow((double)strlen(opts.alphabet), (double)search_len);
-  }
-
 
 #undef getarg
 #undef getcls
 #undef badarg
 }
 
-void *worker(void *arg) {
+void *worker_std(void *arg) {
   unsigned long long start;
   size_t i, j, free_len, alen, plen, slen;
   char *pow, *pow_search;
@@ -914,7 +1029,7 @@ void *worker(void *arg) {
     if (j == opts.algo->digest_size) {
       g_quit = true;
       pthread_mutex_lock(&g_lock);
-      if (NULL == g_pow) {
+      if (!g_pow) {
         g_pow = pow;
       }
       pthread_mutex_unlock(&g_lock);
@@ -933,6 +1048,54 @@ void *worker(void *arg) {
   }
 
   return (void*)i;
+}
+
+void *worker_ccc(void *arg) {
+  uint64_t pow;
+  size_t i;
+  bn_t digest;
+  void *ctx, *ctx_;
+
+  ctx = malloc(opts.algo->ctx_size);
+  ctx_ = malloc(opts.algo->ctx_size);
+
+  digest = malloc(opts.algo->digest_size);
+
+  pow = (uint64_t)arg;
+
+  opts.algo->init(ctx);
+  opts.algo->update(ctx, opts.challenge, strlen(opts.challenge));
+
+  for (i = 0; i < opts.max_tries / opts.num_threads && !g_quit; i++, pow++) {
+    memcpy(ctx_, ctx, opts.algo->ctx_size);
+    opts.algo->update(ctx_, &pow, sizeof(pow));
+    opts.algo->final(digest, ctx_);
+
+    if (bn_cmp(digest, opts.target) < 0) {
+      g_quit = true;
+      pthread_mutex_lock(&g_lock);
+      if (!g_pow) {
+        opts.pow_len = asprintf(&g_pow, "%lu", pow);
+      }
+      pthread_mutex_unlock(&g_lock);
+      return (void*)i;
+    }
+  }
+
+  return (void*)i;
+}
+
+void show_bignum(bn_t a) {
+  int i;
+  for (i = 0; i < bn_size; i++) {
+    if (a[i]) {
+      break;
+    }
+  }
+  fprintf(stderr, "0x%x", a[i]);
+  for (i++; i < bn_size; i++) {
+    fprintf(stderr, "%02x", a[i]);
+  }
 }
 
 void show_large_num(unsigned long long n) {
@@ -997,7 +1160,6 @@ void sighandler(int signum) {
   g_quit = true;
 }
 
-
 int main(int argc, char *argv[]) {
   size_t i;
   pthread_t *threads;
@@ -1008,37 +1170,47 @@ int main(int argc, char *argv[]) {
   parse_args(argc, argv);
 
   if (opts.verbose) {
-    fprintf(stderr, "Alphabet : ");
-    show_string(opts.alphabet, 80, 11);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "           (%lu characters)\n", strlen(opts.alphabet));
-    fprintf(stderr, "Prefix   : ");
-    show_string(opts.prefix, 80, 11);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "Suffix   : ");
-    show_string(opts.suffix, 80, 11);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "Mask     :");
-    for (i = 0; i < opts.algo->digest_size * 8; i++) {
-      if (i % 8 == 0) {
-        fprintf(stderr, " ");
+    if (opts.is_ccc) {
+      fprintf(stderr, "Algorithm: CCC(%s)\n", opts.algo->name);
+      fprintf(stderr, "Challenge: %s\n", opts.challenge);
+      fprintf(stderr, "Hardness : %llu\n", opts.hardness);
+      fprintf(stderr, "Target   : ");
+      show_bignum(opts.target);
+      fprintf(stderr, "\n");
+    } else {
+      fprintf(stderr, "Algorithm: %s\n", opts.algo->name);
+      fprintf(stderr, "Alphabet : ");
+      show_string(opts.alphabet, 80, 11);
+      fprintf(stderr, "\n");
+      fprintf(stderr, "           (%lu characters)\n", strlen(opts.alphabet));
+      fprintf(stderr, "Prefix   : ");
+      show_string(opts.prefix, 80, 11);
+      fprintf(stderr, "\n");
+      fprintf(stderr, "Suffix   : ");
+      show_string(opts.suffix, 80, 11);
+      fprintf(stderr, "\n");
+      fprintf(stderr, "Mask     :");
+      for (i = 0; i < opts.algo->digest_size * 8; i++) {
+        if (i % 8 == 0) {
+          fprintf(stderr, " ");
+        }
+        if (i && i % 64 == 0) {
+          fprintf(stderr, "\n           ");
+        }
+        if (opts.omask[i / 8] & (1 << (7 - i % 8))) {
+          fprintf(stderr, "1");
+        } else if (opts.zmask[i / 8] & (1 << (7 - i % 8))) {
+          fprintf(stderr, "0");
+        } else {
+          fprintf(stderr, "?");
+        }
       }
-      if (i && i % 64 == 0) {
-        fprintf(stderr, "\n           ");
-      }
-      if (opts.omask[i / 8] & (1 << (7 - i % 8))) {
-        fprintf(stderr, "1");
-      } else if (opts.zmask[i / 8] & (1 << (7 - i % 8))) {
-        fprintf(stderr, "0");
-      } else {
-        fprintf(stderr, "?");
-      }
+      fprintf(stderr, "\n");
+      fprintf(stderr, "Length   : %lu\n", opts.pow_len);
+      fprintf(stderr, "Endian   : %s\n", opts.big_endian ? "big" : "little");
+      fprintf(stderr, "Binary   : %s\n", opts.is_binary ? "yes" : "no");
     }
-    fprintf(stderr, "\n");
     fprintf(stderr, "Threads  : %lu\n", opts.num_threads);
-    fprintf(stderr, "Length   : %lu\n", opts.pow_len);
-    fprintf(stderr, "Endian   : %s\n", opts.big_endian ? "big" : "little");
-    fprintf(stderr, "Binary   : %s\n", opts.is_binary ? "yes" : "no");
     fprintf(stderr, "Max tries: ");
     show_large_num(opts.max_tries);
     fprintf(stderr, " (");
@@ -1069,7 +1241,8 @@ int main(int argc, char *argv[]) {
 
   for (i = 0; i < opts.num_threads; i++) {
     start = (opts.max_tries * i) / opts.num_threads;
-    pthread_create(&threads[i], NULL, worker, (void*)start);
+    pthread_create(&threads[i], NULL, opts.is_ccc ? worker_ccc : worker_std,
+                   (void*)start);
   }
 
   tries_total = 0;

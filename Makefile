@@ -1,6 +1,8 @@
 .PHONY: all clean
 
 CFLAGS=-O9
+# Un-comment for debugging
+# CFLAGS=-g
 OBJS=sha3.o
 
 all: pow
