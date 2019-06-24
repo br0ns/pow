@@ -180,6 +180,7 @@ struct {
 
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 char *g_pow = NULL;
+unsigned long long g_progress;
 
 /* This variable is only ever changed from false to true and are read
  * continuously so no locking is necessary
@@ -346,13 +347,21 @@ void usage(char *prog) {
           "Mask:\n"
           "  By default a mask specifies the most significant bits of the digest.  Use\n"
           "  \"-\" to specify that the rest of the mask specify the least significant\n"
-          "  bits.  A bit value can be 1, 0 or ? if the value may be either.  A bit value\n"
-          "  may be followed by a repeat count enclosed in curly braces.  Examples:\n"
-          "    1{20}: 20 leading 1's.  Matches fffff...\n"
-          "    -0{16}: 16 trailing 0's.  Matches ...0000\n"
-          "    1{12} combined with `--endian little`: Matches ...f?ff\n"
-          "    -1111????1{8}: Equivalent to the previous\n"
-          "    1{12}-0{12}: Matches fff...000\n"
+          "  bits.  By default each digit of the mask correspond to a single bit.  With the\n"
+          "  prefix \"0x\" each digit correspond to 4 bits given by a hexadecimal digit. The\n"
+          "  prefix must be given for the most and least significant parts separately. The\n"
+          "  character ? matches any value.  A digit may be followed by a repeat count\n"
+          "  enclosed in curly braces.  Examples:\n"
+          "    1{20}         : 20 leading 1's.  Matches fffff...\n"
+          "    0xf{5}        : Equivalent to the previous\n"
+          "    -0{16}        : 16 trailing 0's.  Matches ...0000\n"
+          "    -0x0000       : Equivalent to the previous\n"
+          "    1{12} combined with `--endian little`:\n"
+          "                    Matches ...f?ff\n"
+          "    -1111????1{8} : Equivalent to the previous\n"
+          "    -0xf?ff       : Equivalent to the previous\n"
+          "    1{12}-0{12}   : Matches fff...000\n"
+          "    0xfff-0x000   : Equivalent to the previous\n"
           "\n"
           "Supported algorithms:\n", prog);
 
@@ -520,8 +529,8 @@ void parse_mask() {
   char *p;
   size_t i, j, n, len_head, len_tail,
     nbits = opts.algo->digest_size * 8;
-  char bit, d;
-  bool has_tail;
+  char m, d;
+  bool has_tail, is_hex;
   unsigned char
     zmask[nbits],
     omask[nbits];
@@ -531,22 +540,34 @@ void parse_mask() {
   opts.zmask = calloc(opts.algo->digest_size, 1);
   opts.omask = calloc(opts.algo->digest_size, 1);
 
+  /* Parse mask */
   i = 0;
   p = opts.mask;
   has_tail = false;
+  is_hex = false;
   while (*p) {
-    if (i >= nbits) {
-      die("mask is larger than digest\n");
-    }
+    /* if (i >= nbits) { */
+    /*   die("mask is larger than digest\n"); */
+    /* } */
 
-    if ('-' == *p) {
+    /* Tail of mask? */
+    if (!has_tail && '-' == *p) {
       has_tail = true;
+      is_hex = false;
       len_head = i;
       p++;
     }
 
-    bit = *p++;
+    /* Is mask in hexadecimal? */
+    if (!is_hex && '0' == p[0] && 'x' == (p[1] | 0x20)) {
+      is_hex = true;
+      p += 2;
+    }
 
+    /* This mask bit/nibble. */
+    m = *p++;
+
+    /* Repetition */
     if ('{' == *p) {
       p++;
       n = 0;
@@ -562,23 +583,57 @@ void parse_mask() {
       n = 1;
     }
 
-    j = n + i;
-
-    for (; i < j && i < nbits; i++) {
-      switch (bit) {
-      case '1':
-        omask[i] = 1;
-        break;
-      case '0':
-        zmask[i] = 1;
-      case '?':
-        break;
-      default:
-        die("invalid mask: %s\n", opts.mask);
-      }
+    /* Check mask length */
+    if (i + n * (is_hex ? 4 : 1) >= nbits) {
+      die("mask is larger than digest\n");
     }
+
+    if ('?' != m) {
+      /* Parse mask digit */
+      if (is_hex) {
+        switch (m) {
+        case '0'...'9':
+          m -= '0';
+          break;
+        case 'a'...'z':
+          m -= 'a' - 10;
+          break;
+        case 'A'...'Z':
+          m -= 'A' - 10;
+          break;
+        default:
+          goto INVALID;
+        }
+      } else {
+        switch (m) {
+        case '0':
+          m = 0;
+          break;
+        case '1':
+          m = 1;
+          break;
+        default:
+        INVALID:
+          die("invalid mask: %s\n", opts.mask);
+        }
+      }
+      /* Set mask bits */
+      for (j = 0; j < n; j++) {
+        if (is_hex) {
+          (m & 8 ? omask : zmask)[i++] = 1;
+          (m & 4 ? omask : zmask)[i++] = 1;
+          (m & 2 ? omask : zmask)[i++] = 1;
+        }
+        (m & 1 ? omask : zmask)[i++] = 1;
+      }
+    } else {
+      /* Skip wildcard bits */
+      i += n * (is_hex ? 4 : 1);
+    }
+
   }
 
+  /* Move tail to end */
   if (has_tail) {
     len_tail = i - len_head;
     memmove(&zmask[nbits - len_tail], &zmask[len_head],
@@ -589,6 +644,7 @@ void parse_mask() {
     memset(&omask[len_head], 0, nbits - len_head - len_tail);
   }
 
+  /* Compress mask to bytes */
   for (i = 0; i < nbits; i++) {
     if (opts.big_endian) {
       opts.zmask[i / 8] |= zmask[i] << (7 - i % 8);
@@ -978,7 +1034,7 @@ void parse_args(int argc, char *argv[]) {
 #undef getcls
 #undef badarg
 }
-
+void show_large_num(unsigned long long n);
 void *worker_std(void *arg) {
   unsigned long long start;
   size_t i, j, free_len, alen, plen, slen;
@@ -1014,6 +1070,16 @@ void *worker_std(void *arg) {
   opts.algo->update(ctx, opts.prefix, plen);
 
   for (i = 0; i < opts.max_tries / opts.num_threads && !g_quit; i++) {
+
+    if (i % 1000000 == 0) {
+      pthread_mutex_lock(&g_lock);
+      g_progress += 1000000;
+      fprintf(stderr, "\033[G\033[K");
+      show_large_num(g_progress);
+      fflush(stderr);
+      pthread_mutex_unlock(&g_lock);
+    }
+
     memcpy(ctx_, ctx, opts.algo->ctx_size);
     opts.algo->update(ctx_, pow_search, opts.pow_len - plen);
     opts.algo->final(digest, ctx_);
